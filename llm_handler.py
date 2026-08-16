@@ -1,77 +1,133 @@
 """
-llm_handler.py
 MSAI 631 Course Support RAG Chatbot
-Contributor: Ashraf Mohammad
+Contributor area: Ashraf Mohammad
 
-Generates a natural-language answer from a question and the retrieved
-context passages. Uses a small, free Hugging Face text2text model
-(google/flan-t5-base) when the transformers library and the model are
-available; no API key is required.
+Reference local Hugging Face language-model wrapper.
+Ashraf should review, modify, test, and commit his own version.
 
-If transformers is not installed or the model cannot be loaded, this
-handler falls back to an extractive answer that returns the most relevant
-retrieved passage. This guarantees the RAG pipeline always produces a
-grounded response, satisfying the assignment's requirement that the code
-run without errors even on a laptop with no GPU.
+If a model cannot be loaded in free Colab, the RAG pipeline can continue
+in retrieval-only mode instead of crashing.
 """
 
-from __future__ import annotations
+from typing import Optional
+import torch
 
-from typing import List
+from config import (
+    BACKUP_LLM_NAME,
+    MAX_NEW_TOKENS,
+    PRIMARY_LLM_NAME,
+    TEMPERATURE,
+)
 
 
-DEFAULT_MODEL = "google/flan-t5-base"
+SYSTEM_PROMPT = """You are a course-support assistant.
+Answer ONLY from the supplied course-document context.
+Do not invent requirements, grades, deadlines, or instructor policies.
+If the context does not support an answer, say that you could not find
+enough information in the uploaded course documents.
+Keep the answer concise and useful."""
 
 
-class LLMHandler:
-    """Wraps a small seq2seq LLM with a safe extractive fallback."""
-
-    def __init__(self, model_name: str = DEFAULT_MODEL, enable_llm: bool = True):
-        self.model_name = model_name
-        self.enable_llm = enable_llm
-        self._pipe = None
-        self._using_fallback = True
-        if enable_llm:
-            self._load()
-
-    def _load(self) -> None:
-        try:
-            from transformers import pipeline
-            self._pipe = pipeline("text2text-generation", model=self.model_name)
-            self._using_fallback = False
-        except Exception:
-            self._pipe = None
-            self._using_fallback = True
+class LocalLLM:
+    def __init__(
+        self,
+        primary_model: str = PRIMARY_LLM_NAME,
+        backup_model: str = BACKUP_LLM_NAME,
+    ):
+        self.primary_model = primary_model
+        self.backup_model = backup_model
+        self.model = None
+        self.tokenizer = None
+        self.model_name: Optional[str] = None
+        self.load_error: Optional[str] = None
 
     @property
-    def using_fallback(self) -> bool:
-        return self._using_fallback
+    def available(self) -> bool:
+        return self.model is not None and self.tokenizer is not None
 
-    def build_prompt(self, question: str, contexts: List[str]) -> str:
-        """Construct a grounded RAG prompt from the question and context."""
-        context_block = "\n\n".join(f"- {c}" for c in contexts)
-        return (
-            "You are a helpful course-support assistant. Answer the question "
-            "using ONLY the context below. If the answer is not in the context, "
-            "say you do not have that information.\n\n"
-            f"Context:\n{context_block}\n\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
+    def _try_load(self, model_name: str) -> bool:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    def generate(self, question: str, contexts: List[str]) -> str:
-        """Return an answer grounded in the provided context passages."""
-        if not contexts:
-            return ("I do not have any indexed course documents yet. "
-                    "Please upload and index documents first.")
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-        if self._pipe is not None:
-            prompt = self.build_prompt(question, contexts)
-            out = self._pipe(prompt, max_length=256, truncation=True)
-            return out[0]["generated_text"].strip()
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
 
-        # Extractive fallback: return the most relevant passage, trimmed.
-        best = contexts[0].strip()
-        snippet = best if len(best) <= 500 else best[:500] + "..."
-        return ("Based on the most relevant course material I found:\n\n"
-                f"{snippet}")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
+            model.eval()
+
+            self.tokenizer = tokenizer
+            self.model = model
+            self.model_name = model_name
+            self.load_error = None
+            return True
+        except Exception as exc:
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def load(self) -> bool:
+        if self.available:
+            return True
+
+        if self._try_load(self.primary_model):
+            return True
+
+        return self._try_load(self.backup_model)
+
+    def generate(self, question: str, context: str) -> str:
+        if not self.available and not self.load():
+            raise RuntimeError(
+                "No language model could be loaded. "
+                f"Last error: {self.load_error}"
+            )
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"COURSE DOCUMENT CONTEXT:\n{context}\n\nQUESTION:\n{question}",
+            },
+        ]
+
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"COURSE DOCUMENT CONTEXT:\n{context}\n\n"
+                f"QUESTION:\n{question}\nANSWER:"
+            )
+
+        device = next(self.model.parameters()).device
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+
+        generation_kwargs = {
+            "max_new_tokens": MAX_NEW_TOKENS,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+
+        if TEMPERATURE and TEMPERATURE > 0:
+            generation_kwargs.update(
+                do_sample=True,
+                temperature=TEMPERATURE,
+                top_p=0.9,
+            )
+        else:
+            generation_kwargs["do_sample"] = False
+
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **generation_kwargs)
+
+        new_tokens = output_ids[0, inputs["input_ids"].shape[1]:]
+        answer = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return answer
