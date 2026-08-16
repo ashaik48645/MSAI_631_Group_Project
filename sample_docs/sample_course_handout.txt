@@ -1,0 +1,9 @@
+MSAI 631 Sample Course Handout
+
+This sample document exists only to demonstrate retrieval.
+
+Group Project Design Documentation:
+The design document should explain the real-world problem, the system inputs and outputs, the proposed design approach, and anticipated limitations. A three-to-five-page design document is a reasonable length.
+
+Source Code:
+The source code should be stored in a repository accessible to the instructor and should also be submitted as a ZIP archive. Reused code should be credited.
